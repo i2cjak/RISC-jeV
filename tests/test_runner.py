@@ -1,114 +1,73 @@
-import copy
 import json
+import re
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from jev import GATES, JevError, cases, payload, truth_tables, validate_response
+from engine import Simulation
+from jev import JevError, answer_bit, payload
 from netlist import translate
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def reference_response():
-    """Test fixture, never evidence of a real API call."""
+def reference_response(body):
+    """Native logic for tests only. Never called by the app or live engine."""
     answers = {}
-    for name, gate, _, _, bits in cases():
-        bit = GATES[gate][2][int(bits, 2)]
-        choice = "true" if bit == "1" else "false"
-        answers[name] = {
-            "type": "choice", "choice": choice, "confidence": 1.0,
-            "probabilities": {"false": float(bit == "0"), "true": float(bit == "1")},
-        }
-    return {"model": "test-fixture", "answers": answers, "usage": {"input_tokens": 2118, "output_tokens": 695}}
+    for name, question in body["questions"].items():
+        expr, bits = re.search(r"output of (.*),([01]+)\?", question["instructions"]).groups()
+        values = list(map(int, bits))
+        a = values[0]
+        b = values[1] if len(values) > 1 else 0
+        select = values[2] if len(values) > 2 else 0
+        value = {"!A": 1 - a, "AB": a & b, "A+B": a | b, "A^B": a ^ b, "S?B:A": b if select else a}[expr]
+        answers[name] = {"type": "choice", "choice": "true" if value else "false", "confidence": 0.01}
+    return {"model": "test-fixture", "answers": answers, "usage": {"input_tokens": 2118}}
+
+
+def fixture_request(body, **kwargs):
+    return reference_response(body), 0.001
 
 
 class ClassifierTests(unittest.TestCase):
-    def test_independent_questions_include_expression_and_inputs(self):
-        questions = payload()["questions"]
-        self.assertEqual(len(questions), 22)
-        self.assertIn("AB,01", questions["AND_01"]["instructions"])
-        self.assertIn("A+B,01", questions["OR_01"]["instructions"])
-        self.assertIn("S=1", questions["MUX_011"]["instructions"])
+    def test_identical_gates_get_distinct_questions(self):
+        body = payload([{"id": 3, "gate": "AND", "bits": "01"}, {"id": 9, "gate": "AND", "bits": "01"}])
+        self.assertEqual(list(body["questions"]), ["g_3", "g_9"])
+        self.assertEqual(body["questions"]["g_3"], body["questions"]["g_9"])
+        self.assertIn("AB,01", body["questions"]["g_3"]["instructions"])
 
-    def test_every_truth_table_row(self):
-        tables = validate_response(reference_response())
-        self.assertEqual(tables["AND"][1], 0)
-        self.assertEqual(tables["OR"][1], 1)
-        for a in (0, 1):
-            self.assertEqual(tables["NOT"][a], 1 - a)
-            for b in (0, 1):
-                self.assertEqual(tables["AND"][2 * a + b], a & b)
-                self.assertEqual(tables["OR"][2 * a + b], a | b)
-                self.assertEqual(tables["XOR"][2 * a + b], a ^ b)
-                for s in (0, 1):
-                    self.assertEqual(tables["MUX"][4 * a + 2 * b + s], b if s else a)
+    def test_wrong_low_confidence_choice_is_used_unchanged(self):
+        # AB,01 should be false; use the model's true anyway, including with
+        # absent, contradictory or nonsensical confidence/probability metadata.
+        for extra in ({}, {"confidence": 0.01}, {"confidence": float("nan"), "probabilities": {"false": 1, "true": 0}}):
+            self.assertEqual(answer_bit({"choice": "true", **extra}, "AB,01"), 1)
+        self.assertEqual(answer_bit({"choice": "false"}, "A+B,01"), 0)
 
-    def test_wrong_answer_is_rejected_never_corrected(self):
-        response = reference_response()
-        response["answers"]["AND_01"] = copy.deepcopy(response["answers"]["OR_01"])
-        with self.assertRaisesRegex(JevError, "misclassified"):
-            validate_response(response)
-
-    def test_missing_answer_rejected(self):
-        response = reference_response()
-        del response["answers"]["NOT_0"]
-        with self.assertRaisesRegex(JevError, "Incomplete"):
-            validate_response(response)
-
-    def test_low_confidence_and_invalid_probability_rejected(self):
-        for bad_value in (0.1, float("nan"), 1.1):
-            response = reference_response()
-            response["answers"]["AND_00"]["confidence"] = bad_value
+    def test_missing_wire_value_has_no_fallback(self):
+        for answer in (None, {}, {"choice": "maybe"}):
             with self.assertRaises(JevError):
-                validate_response(response)
-        response = reference_response()
-        response["answers"]["AND_00"]["probabilities"]["false"] = 0
-        with self.assertRaises(JevError):
-            validate_response(response)
+                answer_bit(answer, "gate")
 
-    def test_cache_reuse_refresh_and_model_mismatch(self):
-        with tempfile.TemporaryDirectory() as directory:
-            cache = Path(directory) / "tables.json"
-            with patch("jev.request", return_value=(reference_response(), 0.1)) as api:
-                _, _, cached = truth_tables(cache)
-                self.assertFalse(cached)
-                _, _, cached = truth_tables(cache)
-                self.assertTrue(cached)
-                self.assertEqual(api.call_count, 1)
-                truth_tables(cache, refresh=True)
-                self.assertEqual(api.call_count, 2)
-                with self.assertRaisesRegex(JevError, "model/prompt"):
-                    truth_tables(cache, model="different-model")
-
-    def test_corrupt_cached_answer_rejected(self):
-        with tempfile.TemporaryDirectory() as directory:
-            cache = Path(directory) / "tables.json"
-            with patch("jev.request", return_value=(reference_response(), 0.1)):
-                truth_tables(cache)
-            record = json.loads(cache.read_text())
-            record["response"]["answers"]["NOT_0"]["choice"] = "false"
-            cache.write_text(json.dumps(record))
-            with self.assertRaises(JevError):
-                truth_tables(cache)
+    def test_repeated_batches_make_new_requests(self):
+        body = payload([{"id": 0, "gate": "AND", "bits": "01"}])
+        simulation = Simulation(ROOT / "build/demo.bin", lambda event: None)
+        simulation.started = time.monotonic()
+        with patch("engine.request", side_effect=fixture_request) as api:
+            simulation.classify(body)
+            simulation.classify(body)
+            self.assertEqual(api.call_count, 2)
 
 
 class ExecutionTests(unittest.TestCase):
-    def setUp(self):
-        self.directory = tempfile.TemporaryDirectory()
-        self.addCleanup(self.directory.cleanup)
-        self.tables = Path(self.directory.name) / "reference.txt"
-        self.tables.write_text("\n".join(" ".join(spec[2]) for spec in GATES.values()))
-
     def simulate(self, firmware="demo", limit=200000):
         return subprocess.run([
-            str(ROOT / "build/serv_sim"), str(ROOT / f"build/{firmware}.bin"),
-            str(self.tables), str(limit),
-        ], text=True, capture_output=True, timeout=30, check=False)
+            str(ROOT / "build/serv_reference"), str(ROOT / f"build/{firmware}.bin"), str(limit),
+        ], text=True, capture_output=True, timeout=10, check=False)
 
-    def test_compiled_c_program(self):
+    def test_compiled_c_program_with_test_only_native_gates(self):
         result = self.simulate()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("RV32I checks passed: fib(10)=55", result.stdout)
@@ -119,24 +78,49 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("SERV PASS: exit=0", result.stderr)
 
-    def test_cycle_limit_is_failure(self):
+    def test_cycle_limit(self):
         result = self.simulate(limit=10)
         self.assertEqual(result.returncode, 2)
         self.assertIn("TIMEOUT", result.stderr)
 
-    def test_invalid_tables_cannot_run(self):
-        self.tables.write_text("1 0 0 0\n")
-        result = self.simulate()
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("Invalid truth tables", result.stderr)
-
-    def test_gate_results_really_control_execution(self):
-        # Bypass the Python validator on purpose: the simulator must actually
-        # use loaded table bits, not quietly compute the right Boolean answer.
-        self.tables.write_text(" ".join("0" for _ in range(22)))
-        result = self.simulate(limit=100)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertNotIn("SERV PASS", result.stderr)
+    def test_live_gate_choices_drive_dependent_inputs_without_reuse(self):
+        header = (ROOT / "build/serv_netlist.h").read_text().split(" GATES = {{", 1)[1].split("}};", 1)[0]
+        gates = [tuple(map(int, row.split(','))) for row in re.findall(r"\{([0-9,]+)\}", header)]
+        process = subprocess.Popen([str(ROOT / "build/serv_sim"), str(ROOT / "build/demo.bin"), "1"],
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        observed = {}
+        checked = 0
+        passes = set()
+        try:
+            for line in process.stdout:
+                event = json.loads(line)
+                if event["type"] != "gates":
+                    continue
+                phase = event["phase"]
+                passes.add(phase)
+                if event["batch"][0]["id"] == 0:
+                    observed = {}
+                output = "1" if phase == 0 else "0"
+                for gate in event["batch"]:
+                    _, arity, a, b, s, y, level = gates[gate["id"]]
+                    self.assertEqual(level, event["level"])
+                    for wire, bit in zip((a, b, s)[:arity], gate["bits"]):
+                        if wire in observed:
+                            self.assertEqual(bit, observed[wire])
+                            checked += 1
+                    observed[y] = output
+                process.stdin.write(output * len(event["batch"]) + "\n")
+                process.stdin.flush()
+            process.wait(timeout=2)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            for pipe in (process.stdin, process.stdout, process.stderr):
+                pipe.close()
+        self.assertGreater(checked, 1000)
+        self.assertEqual(passes, {0, 1})  # Same gates are asked again before the first clock edge.
+        self.assertEqual(process.returncode, 2)  # One-cycle limit, not an answer rejection.
 
 
 class NetlistTests(unittest.TestCase):

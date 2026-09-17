@@ -9,8 +9,9 @@ and run it. No shared program runs automatically when its link is opened.
 Visitor compilation uses a separate filesystem, no network, an empty environment,
 and CPU/memory/output/time limits. Railway uses a chroot with a dedicated
 unprivileged UID and seccomp; local Linux uses Bubblewrap plus seccomp. A compiler
-error is returned before making a Jev request. Runs stop after five seconds of
-execution or 250,000 cycles, whichever comes first. Paused stepping time is
+error is returned before making a Jev request. Runs stop after five minutes of
+execution (including API latency), 250,000 cycles, or a $0.05 estimated input
+budget, whichever comes first. Paused stepping time is
 excluded. The server allows six concurrent runs and 12 starts per IP per minute.
 Custom compilation has a 30-second per-IP cooldown, a shared limit of 20 per
 minute across the server, and one active compiler. Precompiled examples do not
@@ -55,21 +56,21 @@ uv run --env-file .env gunicorn --daemon \
 
 Use one worker: runs and event streams share in-process state. The server binds
 only to localhost and the Tailnet interface. `make clean` removes build outputs,
-the classification cache, and the server PID/log files; stop the server first.
+and the server PID/log files; stop the server first.
 
 ## Site
 
-- **Run / Pause / Step / Reset:** controls the actual simulator through its input
-  pipe. Step executes one instruction and stops at the following fetch. The
-  highlighted instruction is fetched but has not executed yet while paused.
-- **Fresh Jev:** asks all 22 questions again before each run. **Cached Jev:**
-  reuses the validated response, with no new API cost. A missing cache is fetched.
+- **Run / Pause / Step gates / Reset:** controls the actual simulator. Step gates
+  evaluates one batch of up to 64 independent gates, then pauses. Pause takes
+  effect after the current request; Stop interrupts the run immediately.
 - **Execution:** real instruction fetches, disassembly, PC and cycle count.
   The browser retains the last 300 rows; the server retains up to 12,000 events.
 - **Clock speed:** simulated cycles per wall-clock second. While running it is
   sampled every 250 ms; after completion it shows the full-run average. Jev
   latency and simulator/control overhead are included; user pause time is
   excluded. There is no artificial execution delay.
+- **Gate activity:** each cell is a real gate output in the current evaluation
+  pass: white is 1, gray is 0, dark is unevaluated. Pending gates are highlighted.
 - **Timing:** the last 64 sampled cycles (32 on mobile). CLK depicts the
   simulator's clock phases. FETCH, DATA, SERIAL, RS1 and RD come from actual
   netlist signals sampled before each rising edge. Hover to inspect a cycle and
@@ -77,10 +78,10 @@ the classification cache, and the server PID/log files; stop the server first.
   counter; RS1 and RD are the one-bit register read/write data signals.
 - **Est. input cost:** reported input tokens × `$0.042 / 1,000,000`, using the
   supplied estimate. This excludes output-token pricing and other charges.
-  Cached runs show zero new input tokens/cost. For example, 2,118 input tokens
-  cost an estimated `$0.000088956`.
+  Only responses received before the deadline contribute reported usage. An
+  in-flight request at the deadline may still be billed by the provider.
 - **Jev requests:** model, latency, classifications, and full request/response
-  JSON. Cached evidence is explicitly labeled. No API key reaches the browser.
+  JSON, with separate entries for each batch. No API key reaches the browser.
 
 The interface uses the Berkeley Mono font copied from the local PiCarrier
 project. The font binary is excluded from the public repository. To use a
@@ -95,24 +96,32 @@ tables, and canvas rendering without a frontend framework or build step.
 2. Yosys flattens `serv_rf_top` with CSRs disabled and maps its logic to NOT,
    AND, OR, XOR and MUX gates. The register-file RAM is also mapped into gates
    and flip-flops. The current netlist has 4,637 gates and 1,190 flip-flops.
-3. Jev answers each distinct expression/input combination in a single batch:
-   2 NOT + 4 AND + 4 OR + 4 XOR + 8 MUX = 22 classifications.
-4. Every answer must match Boolean logic and meet the confidence threshold
-   (default 0.90). A wrong, missing or low-confidence answer stops the run.
-   The validator never repairs answers or falls back to local logic.
-5. The C++ simulator loads those answers as runtime lookup tables. Every
-   combinational CPU gate uses them. Flip-flop updates, wiring, memory and
-   memory-mapped output are handled locally.
+3. The simulator walks gates in dependency order. Up to 64 gates at the same
+   dependency level share an API request. Each physical gate has its own
+   question, even when another gate has identical inputs. A dependent gate
+   cannot be requested until its inputs have arrived from Jev.
+4. The returned `true` or `false` choice directly drives that gate's wire.
+   There is no comparison with Boolean truth, no confidence threshold, no
+   correction, no retry of wrong answers and no result cache. Only an absent
+   or non-Boolean answer is an error because it cannot represent a wire value.
+5. Every combinational gate is asked again on both evaluation passes of every
+   cycle, even when its inputs have not changed. Flip-flop updates, wiring,
+   memory and memory-mapped output are handled locally.
 
-**Jev's answers are memoized.** The site does not make a new API request for
-every gate evaluation or CPU clock. The displayed gate count measures table
-lookups; the request count measures classification batches. The API model is
-probabilistic, so every refreshed response is validated again.
-
-The cache in `build/jev_truth_tables.json` includes model, timestamp, prompt
-fingerprint, usage, confidence and complete answers. Reusing the cache requires
-the same prompt/model and another successful validation. Startup and synthesis
-don't-care values are zero; this is a two-state simulation.
+The public run limit is five active wall-clock minutes, including API latency,
+and $0.05 of estimated input cost at the supplied $0.042/MTok rate. Before each
+request, the server reserves a conservative input-token allowance for the full
+batch and refuses to send it if that would exceed the remaining budget. After
+the response, reported usage replaces the reservation. Missing usage stops
+the run. This is an input estimate, not a cap on the provider's complete invoice:
+output charges are excluded and a request in flight when stopped may be billed.
+The budget can expire during reset, before the first instruction.
+The UI shows those real partial gate evaluations; it does not invent clock
+progress or program output. User pauses do not consume the execution budget.
+Clock speed counts completed simulated cycles only. Native Boolean evaluation
+exists only in a separate `serv_reference` executable compiled by test targets;
+`make build` and the deployed image do not build it, and the site cannot select it.
+Startup and synthesis don't-care values are zero; this is a two-state simulation.
 
 The custom simulator board has 64 KiB RAM at address zero, byte console output at
 `0x10000000`, and a 32-bit exit status at `0x10000004`. Unmapped data reads return
@@ -124,13 +133,8 @@ and divide. No physical MCU or FPGA is flashed.
 
 ```sh
 uv run --env-file .env python run.py classify 'AB,01' 'A+B,01'
-uv run --env-file .env python run.py gates --refresh
-uv run --env-file .env python run.py run build/fibonacci.bin --refresh
-uv run python run.py run build/demo.bin --backend reference
+uv run --env-file .env python run.py run build/fibonacci.bin
 ```
-
-The explicitly selected `reference` backend uses local Boolean tables for
-diagnostics and reports that it makes no Jev requests. The default is `jev`.
 
 To add a program, save `firmware/name.c`, then run `make build/name.bin` and
 `uv run --env-file .env python run.py run build/name.bin`. `firmware/io.h`
@@ -142,14 +146,14 @@ provides console output without a C library. Add its name to `PROGRAMS` in
 ```sh
 make test
 node --check static/app.js
-uvx ruff check app.py jev.py netlist.py run.py tests
+uvx ruff check app.py engine.py jev.py netlist.py run.py tests
 make check-rtl                     # requires Icarus Verilog (iverilog + vvp)
 ```
 
-Tests cover compiled code, RV32I instructions, real control of the CPU by table
-values, bad classifications, cache validity, cycle limits, web event streams,
-stepping, cancellation, timing samples and cost calculations. Routine tests
-mock API calls; they do not spend API tokens.
+Tests cover compiled code and RV32I instructions with the separate native test
+executable, live gate dependencies, repeated questions, propagation of wrong and
+low-confidence answers, execution deadlines, pause/stop, compiler isolation and
+cooldowns. Routine tests mock API calls and do not spend API tokens.
 
 `check-rtl` runs the original SERV Verilog independently and compares program
 output, cycle counts and bus transaction counts against the gate simulator.

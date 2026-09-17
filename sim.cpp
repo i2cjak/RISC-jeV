@@ -9,30 +9,21 @@
 #include <string>
 #include <vector>
 
-// Only wiring, storage and host bus services are native. Every combinational
-// CPU gate reads an answer from the externally supplied Jev truth tables.
+#ifdef SERV_REFERENCE_TEST
+#include "tests/reference_gate.h"
+#endif
+
+// Wiring, storage and host bus services are native. Each combinational gate
+// evaluation waits for its own fresh Jev choice before driving an output wire.
 class CPU {
 public:
     std::array<uint8_t, NET_COUNT> nets{};
     std::array<uint8_t, FLOPS.size()> next{};
-    std::array<std::array<uint8_t, 8>, 5> tables{};
     uint64_t evaluations = 0;
 
-    explicit CPU(const std::string &path) {
+    CPU() {
         nets[1] = 1;
         for (auto init : INITIAL) nets[init.q] = init.d;
-        std::ifstream file(path);
-        if (!file) throw std::runtime_error("Cannot open truth tables");
-        const std::array<unsigned, 5> sizes{2, 4, 4, 4, 8};
-        for (unsigned op = 0; op < sizes.size(); ++op) {
-            for (unsigned i = 0; i < sizes[op]; ++i) {
-                unsigned value;
-                if (!(file >> value) || value > 1) throw std::runtime_error("Invalid truth tables");
-                tables[op][i] = value;
-            }
-        }
-        std::string extra;
-        if (file >> extra) throw std::runtime_error("Unexpected extra truth table data");
     }
 
     template<size_t N> uint32_t read(const std::array<unsigned, N> &port) const {
@@ -45,14 +36,43 @@ public:
         for (unsigned i = 0; i < N; ++i) nets[port[i]] = (value >> i) & 1;
     }
 
-    void evaluate() {
+    void evaluate(uint64_t cycle, unsigned phase) {
+#ifdef SERV_REFERENCE_TEST
+        (void)cycle;
+        (void)phase;
         for (auto gate : GATES) {
-            unsigned index = nets[gate.a];
-            if (gate.arity >= 2) index = (index << 1) | nets[gate.b];
-            if (gate.arity == 3) index = (index << 1) | nets[gate.s];
-            nets[gate.y] = tables[gate.op][index];
+            nets[gate.y] = reference_gate(gate.op, nets[gate.a], nets[gate.b], nets[gate.s]);
+            ++evaluations;
         }
-        evaluations += GATES.size();
+#else
+        constexpr std::array<const char *, 5> names{"NOT", "AND", "OR", "XOR", "MUX"};
+        for (unsigned start = 0; start < GATES.size();) {
+            unsigned end = start + 1;
+            // Only gates in one dependency level may share a request. Never
+            // merge gates with identical expressions/inputs or reuse answers.
+            while (end < GATES.size() && end - start < 64 && GATES[end].level == GATES[start].level) ++end;
+            std::cout << "{\"type\":\"gates\",\"cycle\":" << cycle << ",\"phase\":" << phase
+                      << ",\"level\":" << GATES[start].level << ",\"gates\":" << evaluations
+                      << ",\"total_gates\":" << GATES.size() << ",\"batch\":[";
+            for (unsigned index = start; index < end; ++index) {
+                const auto gate = GATES[index];
+                if (index != start) std::cout << ',';
+                std::cout << "{\"id\":" << index << ",\"gate\":\"" << names[gate.op] << "\",\"bits\":\""
+                          << unsigned(nets[gate.a]);
+                if (gate.arity >= 2) std::cout << unsigned(nets[gate.b]);
+                if (gate.arity == 3) std::cout << unsigned(nets[gate.s]);
+                std::cout << "\"}";
+            }
+            std::cout << "]}" << std::endl;
+            std::string choices;
+            if (!std::getline(std::cin, choices)) throw std::runtime_error("Gate input pipe closed");
+            if (choices.size() != end - start || choices.find_first_not_of("01") != std::string::npos)
+                throw std::runtime_error("Expected one returned bit per gate");
+            for (unsigned index = start; index < end; ++index) nets[GATES[index].y] = choices[index - start] - '0';
+            evaluations += end - start;
+            start = end;
+        }
+#endif
     }
 
     void edge() {
@@ -93,11 +113,14 @@ public:
 };
 
 int main(int argc, char **argv) try {
-    if (argc != 4 && argc != 5) throw std::runtime_error("Usage: serv_sim FIRMWARE.bin TABLES.txt MAX_CYCLES [--interactive]");
-    const bool interactive = argc == 5 && std::string(argv[4]) == "--interactive";
-    if (argc == 5 && !interactive) throw std::runtime_error("Unknown simulator option");
+    if (argc != 3) throw std::runtime_error("Usage: serv_sim FIRMWARE.bin MAX_CYCLES");
+#ifdef SERV_REFERENCE_TEST
+    constexpr bool interactive = false;
+#else
+    constexpr bool interactive = true;
+#endif
     const bool trace = std::getenv("SERV_TRACE") != nullptr;
-    const std::string cycles_arg(argv[3]);
+    const std::string cycles_arg(argv[2]);
     if (cycles_arg.empty() || cycles_arg.find_first_not_of("0123456789") != std::string::npos)
         throw std::runtime_error("MAX_CYCLES must be a positive integer");
     const uint64_t limit = std::stoull(cycles_arg);
@@ -107,10 +130,11 @@ int main(int argc, char **argv) try {
     std::vector<uint8_t> ram(std::istreambuf_iterator<char>(firmware), {});
     if (ram.empty() || ram.size() > 65536) throw std::runtime_error("Firmware must fit in 64 KiB RAM");
     ram.resize(65536, 0);
-    CPU cpu(argv[2]);
+    CPU cpu;
     Waveform waveform;
+#ifdef SERV_REFERENCE_TEST
     const auto execution_started = std::chrono::steady_clock::now();
-    std::chrono::steady_clock::duration control_wait{};
+#endif
     uint64_t fetches = 0, loads = 0, stores = 0;
     auto word = [&](uint32_t address) {
         address &= ~3u;
@@ -120,17 +144,19 @@ int main(int argc, char **argv) try {
     };
 
     for (uint64_t cycle = 0; cycle < limit; ++cycle) {
-        if ((cycle & 255u) == 0 && std::chrono::steady_clock::now() - execution_started - control_wait >= std::chrono::seconds(5)) {
+#ifdef SERV_REFERENCE_TEST
+        if ((cycle & 255u) == 0 && std::chrono::steady_clock::now() - execution_started >= std::chrono::seconds(5)) {
             std::cerr << "SERV TIMEOUT: 5-second execution limit reached; cycles=" << cycle << '\n';
             return 2;
         }
+#endif
         const bool reset = cycle < 8;
         cpu.write(i_rst, reset);
         cpu.write(i_ibus_ack, 0);
         cpu.write(i_dbus_ack, 0);
         cpu.write(i_ibus_rdt, 0);
         cpu.write(i_dbus_rdt, 0);
-        cpu.evaluate();
+        cpu.evaluate(cycle, 0);
         bool halted = false;
         uint32_t exit_code = 0;
         if (!reset && cpu.read(o_ibus_cyc)) {
@@ -143,10 +169,6 @@ int main(int argc, char **argv) try {
                           << ",\"cycle\":" << cycle << ",\"gates\":" << cpu.evaluations << ",\"wave\":";
                 waveform.json();
                 std::cout << "}" << std::endl;
-                std::string command;
-                const auto waiting_started = std::chrono::steady_clock::now();
-                if (!std::getline(std::cin, command) || command != "go") return 0;
-                control_wait += std::chrono::steady_clock::now() - waiting_started;
             }
             cpu.write(i_ibus_rdt, instruction);
             cpu.write(i_ibus_ack, 1);
@@ -182,9 +204,14 @@ int main(int argc, char **argv) try {
             }
             cpu.write(i_dbus_ack, 1);
         }
-        cpu.evaluate();
+        cpu.evaluate(cycle, 1);
         if (interactive) waveform.sample(cpu, cycle);
         cpu.edge();
+        if (interactive) {
+            std::cout << "{\"type\":\"cycle\",\"cycle\":" << cycle + 1 << ",\"gates\":" << cpu.evaluations << ",\"wave\":";
+            waveform.json();
+            std::cout << "}" << std::endl;
+        }
         if (halted) {
             if (interactive) {
                 std::cout << "{\"type\":\"halt\",\"exit_code\":" << exit_code

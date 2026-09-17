@@ -10,6 +10,7 @@ let samples = [], lastSample = performance.now(), lastCycles = 0, hz = 0;
 let inputTokens = 0, inputCost = 0, wave = [], waveHover = -1;
 let edited = false;
 let compileReadyAt = 0;
+let gateValues = new Uint8Array(4637).fill(2), gatePhase = '', activeBatch = [];
 const expressions = { NOT: '!A', AND: 'AB', OR: 'A+B', XOR: 'A^B', MUX: 'S?B:A' };
 
 function element(tag, text, className) {
@@ -36,7 +37,6 @@ function updateControls() {
   $('run').textContent = running ? 'Pause' : cooldown ? `Compile (${cooldown}s)` : needsCompile ? 'Compile & run' : 'Run';
   $('run').disabled = starting || cooldown > 0;
   $('step').disabled = starting || running || cooldown > 0;
-  $('gate-source').disabled = !!runId && !terminal;
   $('source').readOnly = !!runId && !terminal;
   $('restore').disabled = !!runId && !terminal;
   $('status').textContent = state.charAt(0).toUpperCase() + state.slice(1);
@@ -93,6 +93,7 @@ function render() {
   }
   drawClock();
   drawTiming();
+  drawGates();
   updateControls();
 }
 function scheduleRender() { if (!frame) frame = requestAnimationFrame(render); }
@@ -103,33 +104,58 @@ function details(label, value) {
 }
 function logRequest(event) {
   requestBody = event.request;
+  const phase = `${event.cycle}:${event.phase}`;
+  if (phase !== gatePhase) { gateValues.fill(2); gatePhase = phase; }
+  activeBatch = event.batch;
+  for (const gate of activeBatch) gateValues[gate.id] = 3;
+  $('gate-position').textContent = `Cycle ${numbers.format(event.cycle)} · ${event.phase === 0 ? 'before bus' : 'after bus'} · level ${event.level}`;
   const entry = element('div');
   requestNode = element('div', undefined, 'request-summary');
-  requestNode.append(element('span', event.source === 'api' ? 'POST /v1/systemone' : 'Cached classifications'), element('span', 'Pending'));
-  entry.append(requestNode);
-  $('request-log').replaceChildren(entry);
-  if (event.source === 'api') requests++;
+  requestNode.append(element('span', `#${++requests} · POST /v1/systemone · ${activeBatch.length} gates`), element('span', 'Pending'));
+  entry.append(requestNode, details('Request', requestBody));
+  for (const node of $('request-log').querySelectorAll('details[open]')) node.open = false;
+  $('request-log').prepend(entry);
+  while ($('request-log').children.length > 100) $('request-log').lastElementChild.remove();
 }
 function logResponse(event) {
   const data = event.response;
-  $('model').textContent = data.model;
+  $('model').textContent = data.model || 'Jev';
   inputTokens += event.input_tokens || 0;
   inputCost += event.input_cost_usd || 0;
-  requestNode.lastChild.textContent = event.source === 'api' ? `${Math.round(event.duration * 1000)} ms · 22 answers` : '22 answers · no API call';
+  requestNode.lastChild.textContent = `${Math.round(event.duration * 1000)} ms · ${event.results.length} answers`;
   const entry = requestNode.parentNode;
   const answers = element('details', undefined, 'request-detail');
   answers.open = true;
-  answers.append(element('summary', 'Classifications'));
+  answers.append(element('summary', 'Gate outputs'));
   const grid = element('div', undefined, 'classifications');
-  for (const [name, answer] of Object.entries(data.answers)) {
-    const [gate, bits] = name.split('_');
+  for (const gate of event.results) {
+    gateValues[gate.id] = gate.output;
     const row = element('div', undefined, 'classification');
-    row.title = `Confidence: ${(answer.confidence * 100).toFixed(1)}%`;
-    row.append(element('span', `${expressions[gate]},${bits}`), element('span', answer.choice));
+    row.title = `Gate ${gate.id}`;
+    row.append(element('span', `${expressions[gate.gate]},${gate.bits}`), element('span', String(gate.output)));
     grid.append(row);
   }
+  activeBatch = [];
   answers.append(grid);
-  entry.append(answers, details(event.source === 'api' ? 'Request' : 'Original request', requestBody), details(event.source === 'api' ? 'Response' : 'Cached response', data));
+  entry.append(answers, details('Response', data));
+}
+function drawGates() {
+  const canvas = $('gate-grid'), width = canvas.getBoundingClientRect().width, height = 120;
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  if (canvas.width !== Math.round(width * dpr) || canvas.height !== height * dpr) {
+    canvas.width = Math.round(width * dpr); canvas.height = height * dpr;
+  }
+  const ctx = canvas.getContext('2d'); ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, width, height);
+  const columns = 128, cellWidth = (width - 28) / columns, cellHeight = 3;
+  const colors = ['#555', '#f2f2f2', '#202020', '#999'];
+  for (let index = 0; index < gateValues.length; index++) {
+    ctx.fillStyle = colors[gateValues[index]];
+    ctx.fillRect(14 + index % columns * cellWidth, 5 + Math.floor(index / columns) * cellHeight, Math.max(.5, cellWidth - 1), 2);
+  }
+  const done = gateValues.reduce((count, bit) => count + (bit < 2 ? 1 : 0), 0);
+  $('gate-count').textContent = `${numbers.format(done)} / 4,637 gates`;
+  canvas.setAttribute('aria-label', `${done} gates evaluated in the current pass; ${activeBatch.length} awaiting Jev. White is 1, gray is 0.`);
 }
 function accept(events) {
   for (const event of events) {
@@ -146,9 +172,11 @@ function accept(events) {
       case 'fetch': pendingRows.push(event); break;
       case 'output': $('output').textContent += String.fromCharCode(event.byte); $('output').scrollTop = $('output').scrollHeight; break;
       case 'halt': $('exit-code').textContent = `exit ${event.exit_code}`; break;
-      case 'error': error(event.message); if (requestNode) requestNode.lastChild.textContent = 'Failed'; break;
+      case 'error': error(event.message); if (requestNode && activeBatch.length) requestNode.lastChild.textContent = 'Failed'; break;
+      case 'limit': error(event.message); if (requestNode && activeBatch.length) requestNode.lastChild.textContent = 'Run limit'; break;
       case 'done':
         state = event.state; terminal = true; hz = elapsed ? cycles / elapsed : 0;
+        if (requestNode && activeBatch.length && state === 'stopped') requestNode.lastChild.textContent = 'Stopped';
         samples.push(hz); if (stream) { stream.close(); stream = null; }
         break;
     }
@@ -163,6 +191,7 @@ async function reset() {
   state = 'idle'; terminal = false; starting = false;
   cycles = fetched = lookups = requests = elapsed = hz = 0;
   inputTokens = inputCost = 0; wave = []; waveHover = -1;
+  gateValues.fill(2); gatePhase = ''; activeBatch = []; $('gate-position').textContent = 'Waiting';
   elapsedAt = lastSample = performance.now(); lastCycles = 0;
   pendingRows = []; samples = []; requestNode = null;
   for (const id of ['steps', 'output', 'request-log', 'exit-code']) $(id).replaceChildren();
@@ -179,7 +208,7 @@ async function start(mode) {
   const token = generation;
   starting = true; state = edited ? 'compiling' : 'classifying'; terminal = false; elapsedAt = performance.now(); updateControls();
   try {
-    const options = { program, fresh: $('gate-source').value === 'fresh', mode };
+    const options = { program, mode };
     if (edited) options.source = $('source').value;
     const result = await post('/api/runs', options);
     if (result.compile_cooldown_seconds) compileReadyAt = Date.now() + result.compile_cooldown_seconds * 1000;

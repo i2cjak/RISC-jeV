@@ -8,7 +8,7 @@ RVLINK = -nostdlib -nostartfiles -Wl,--no-relax -T firmware/link.ld
 ENVFILE = $(if $(wildcard .env),--env-file .env,)
 RTL = $(wildcard serv/rtl/*.v)
 
-.PHONY: all build run gates classify test check-rtl serve clean
+.PHONY: all build run classify test check-rtl serve clean
 all: build
 build: build/serv_sim build/compiler_sandbox build/demo.bin build/isa.bin build/fibonacci.bin build/sum.bin build/bitwise.bin
 
@@ -26,6 +26,9 @@ build/serv_netlist.h: build/serv.json netlist.py jev.py run.py
 build/serv_sim: sim.cpp build/serv_netlist.h
 	$(CXX) -O3 -std=c++17 -Wall -Wextra -Werror -I build sim.cpp -o $@
 
+build/serv_reference: sim.cpp build/serv_netlist.h tests/reference_gate.h
+	$(CXX) -O3 -std=c++17 -Wall -Wextra -Werror -DSERV_REFERENCE_TEST -I build sim.cpp -o $@
+
 build/%.elf: firmware/%.c firmware/start.S firmware/link.ld firmware/io.h
 	mkdir -p build
 	$(RISCV_CC) $(RVFLAGS) $(RVLINK) -Wl,-Map,$(@:.elf=.map) firmware/start.S $< -o $@
@@ -42,16 +45,13 @@ build/isa.elf: firmware/isa.S firmware/start.S firmware/link.ld
 run: build
 	$(UV) run --locked $(ENVFILE) python run.py run
 
-gates:
-	$(UV) run --locked $(ENVFILE) python run.py gates
-
 classify:
 	$(UV) run --locked $(ENVFILE) python run.py classify 'AB,01' 'A+B,01'
 
-test: build
+test: build build/serv_reference
 	$(UV) run --locked python -m unittest discover -s tests -v
 
-check-rtl: build
+check-rtl: build build/serv_reference
 	$(UV) run --locked python tests/check_rtl.py
 
 BIND ?= 127.0.0.1:5077

@@ -15,7 +15,8 @@ from flask import Flask, Response, abort, render_template, request, stream_with_
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 from compiler import CompileError, compile_source
-from jev import GATES, JevError, payload, truth_tables
+from engine import MAX_INPUT_COST, MAX_SECONDS, CostLimit, ExecutionTimeout, Simulation
+from jev import JevError
 
 ROOT = Path(__file__).resolve().parent
 PROGRAMS = {"fibonacci": "Fibonacci", "sum": "Sum", "bitwise": "Bitwise", "demo": "Checks"}
@@ -25,7 +26,6 @@ if os.environ.get("RAILWAY_ENVIRONMENT_ID"):
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 jobs = {}
 jobs_lock = threading.Lock()
-classifier_lock = threading.Lock()
 compiler_lock = threading.Lock()
 rate_limits = {}
 compile_limits = {}
@@ -48,10 +48,9 @@ def program_data():
 
 
 class Run:
-    def __init__(self, program, fresh, mode, source=None):
+    def __init__(self, program, mode, source=None):
         self.id = uuid.uuid4().hex
         self.program = program
-        self.fresh = fresh
         self.source = source
         self.binary = ROOT / f"build/{program}.bin"
         self.mode = mode
@@ -65,8 +64,8 @@ class Run:
         self.started = time.monotonic()
         self.paused_seconds = 0
         self.pause_start = None
-        self.process = None
-        self.state = "compiling" if source is not None else "classifying"
+        self.simulation = None
+        self.state = "compiling" if source is not None else "running"
         self.cycle = 0
         self.fetched = 0
         self.disassembly = {}
@@ -80,6 +79,8 @@ class Run:
                 self.disassembly[int(match[1], 16)] = match[3].replace("\t", " ")
 
     def elapsed(self):
+        if self.simulation is not None:
+            return self.simulation.elapsed()
         now = time.monotonic()
         current_pause = now - self.pause_start if self.pause_start is not None else 0
         return max(0, now - self.started - self.paused_seconds - current_pause)
@@ -101,8 +102,8 @@ class Run:
                 return
             if action == "stop":
                 self.cancelled = True
-                if self.process is not None and self.process.poll() is None:
-                    self.process.terminate()
+                if self.simulation is not None:
+                    self.simulation.stop()
             elif action == "run":
                 self.mode = "run"
                 self.credits = 0
@@ -119,6 +120,7 @@ class Run:
             while not self.cancelled and self.mode != "run" and self.credits == 0:
                 if self.pause_start is None:
                     self.pause_start = time.monotonic()
+                    self.simulation.pause(True)
                     self.state = "paused"
                     self.emit({"type": "status", "state": "paused", "cycle": self.cycle})
                 self.condition.wait(timeout=30)
@@ -127,6 +129,7 @@ class Run:
             if self.pause_start is not None:
                 self.paused_seconds += time.monotonic() - self.pause_start
                 self.pause_start = None
+                self.simulation.pause(False)
             if self.cancelled:
                 return False
             if self.credits:
@@ -135,6 +138,15 @@ class Run:
                 self.state = "running"
                 self.emit({"type": "status", "state": "running", "cycle": self.cycle})
             return True
+
+    def simulation_event(self, event):
+        if "cycle" in event:
+            self.cycle = event["cycle"]
+        if event["type"] == "fetch":
+            self.fetched += 1
+            event["assembly"] = self.disassembly.get(event["pc"], "?")
+            event["fetched"] = self.fetched
+        self.emit(event)
 
     def work(self):
         try:
@@ -146,65 +158,16 @@ class Run:
                     self.binary, disassembly = compile_source(self.source, self.id)
                     self.load_disassembly(disassembly)
                 self.emit({"type": "compiled", "bytes": self.binary.stat().st_size})
-            self.state = "classifying"
-            self.emit({"type": "status", "state": "classifying"})
-            cache = ROOT / "build/jev_truth_tables.json"
-            with classifier_lock:
-                if self.cancelled:
-                    return
-                needs_api = self.fresh or not cache.exists()
-                body = payload()
-                self.emit({"type": "request", "source": "api" if needs_api else "cache", "request": body})
-                tables, record, cached = truth_tables(cache, refresh=self.fresh)
-                self.emit({
-                    "type": "response", "source": "cache" if cached else "api",
-                    "response": record["response"], "duration": record["elapsed_seconds"],
-                    "created_at": record["created_at"],
-                    "input_tokens": 0 if cached else record["response"].get("usage", {}).get("input_tokens", 0),
-                    "input_cost_usd": 0 if cached else record["response"].get("usage", {}).get("input_tokens", 0) * 0.042 / 1000000,
-                    "input_price_per_million": 0.042,
-                })
             if self.cancelled:
                 return
-            table_file = ROOT / "build" / f"web-{self.id}.tables"
-            table_file.write_text("\n".join(" ".join(map(str, tables[gate])) for gate in GATES) + "\n")
-            try:
-                self.process = subprocess.Popen([
-                    str(ROOT / "build/serv_sim"), str(self.binary),
-                    str(table_file), "250000", "--interactive",
-                ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
-                for line in self.process.stdout:
-                    if self.cancelled:
-                        break
-                    event = json.loads(line)
-                    if event["type"] == "fetch":
-                        self.cycle = event["cycle"]
-                        self.fetched += 1
-                        event["assembly"] = self.disassembly.get(event["pc"], "?")
-                        event["fetched"] = self.fetched
-                    elif event["type"] == "halt":
-                        self.cycle = event["cycle"]
-                    self.emit(event)
-                    if event["type"] == "fetch":
-                        if not self.wait_for_permission():
-                            break
-                        self.process.stdin.write("go\n")
-                        self.process.stdin.flush()
-                self.process.stdin.close()
-                self.process.wait(timeout=10)
-                if self.process.returncode and not self.cancelled:
-                    detail = self.process.stderr.read().strip()
-                    raise RuntimeError(detail or "Simulator exited with an error")
-            finally:
-                if self.process is not None:
-                    if self.process.poll() is None:
-                        self.process.terminate()
-                        self.process.wait(timeout=5)
-                    for pipe in (self.process.stdin, self.process.stdout, self.process.stderr):
-                        if pipe and not pipe.closed:
-                            pipe.close()
-                table_file.unlink(missing_ok=True)
+            self.simulation = Simulation(self.binary, self.simulation_event, self.wait_for_permission)
+            self.state = "running"
+            self.emit({"type": "status", "state": "running"})
+            self.simulation.run()
             self.state = "stopped" if self.cancelled else "complete"
+        except (ExecutionTimeout, CostLimit) as error:
+            self.state = "limit"
+            self.emit({"type": "limit", "message": str(error)})
         except (JevError, CompileError, OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
             self.state = "stopped" if self.cancelled else "error"
             if not self.cancelled:
@@ -243,7 +206,8 @@ def headers(response):
 @app.get("/")
 def index():
     version = max((ROOT / "static/app.js").stat().st_mtime_ns, (ROOT / "static/style.css").stat().st_mtime_ns)
-    return render_template("index.html", programs=program_data(), version=version)
+    return render_template("index.html", programs=program_data(), version=version,
+                           max_minutes=int(MAX_SECONDS / 60), input_budget=f"${MAX_INPUT_COST:.2f}")
 
 
 @app.get("/health")
@@ -256,8 +220,8 @@ def start_run():
     data = request.get_json()
     if not isinstance(data, dict) or data.get("program") not in PROGRAMS:
         abort(400, "Unknown program")
-    if data.get("mode", "run") not in ("run", "step") or type(data.get("fresh", True)) is not bool:
-        abort(400, "Invalid mode or gate source")
+    if data.get("mode", "run") not in ("run", "step"):
+        abort(400, "Invalid mode")
     source = data.get("source")
     if source is not None and (not isinstance(source, str) or not source.strip() or len(source.encode()) > 12000):
         abort(400, "Enter a C program up to 12 KB")
@@ -279,7 +243,7 @@ def start_run():
         for identifier in list(jobs):
             if len(jobs) >= 24 and jobs[identifier].done:
                 del jobs[identifier]
-        job = Run(data["program"], data.get("fresh", True), data.get("mode", "run"), source)
+        job = Run(data["program"], data.get("mode", "run"), source)
         jobs[job.id] = job
         if source is not None:
             if len(compile_limits) > 10000:
@@ -293,7 +257,8 @@ def start_run():
 @app.get("/api/limits")
 def limits():
     with jobs_lock:
-        return {"compile_retry_after": compilation_delay(request.remote_addr or "unknown", time.monotonic())}
+        return {"compile_retry_after": compilation_delay(request.remote_addr or "unknown", time.monotonic()),
+                "max_execution_seconds": MAX_SECONDS, "max_input_cost_usd": MAX_INPUT_COST}
 
 
 @app.errorhandler(400)
