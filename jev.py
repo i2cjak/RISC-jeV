@@ -1,10 +1,13 @@
-"""Live Boolean gate questions for Jev. Returned choices become wire values."""
+"""Jev Boolean classifications and their reusable lookup-table evidence."""
 
+import hashlib
 import json
 import os
 import time
 import urllib.error
 import urllib.request
+from datetime import UTC, datetime
+from pathlib import Path
 
 ENDPOINT = "https://api.typesafe.ai/v1/systemone"
 MODEL = "jev-latest"
@@ -85,3 +88,46 @@ def answer_bit(answer, name):
     if choice not in ("false", "true"):
         raise JevError(f"No Boolean choice returned for {name}.")
     return int(choice == "true")
+
+
+def table_cases():
+    batch = []
+    for gate, (_, variables) in GATES.items():
+        for index in range(1 << len(variables)):
+            batch.append({"id": len(batch), "gate": gate, "bits": f"{index:0{len(variables)}b}"})
+    return batch
+
+
+def table_values(response):
+    tables = {gate: [] for gate in GATES}
+    for item in table_cases():
+        tables[item["gate"]].append(answer_bit(response["answers"].get(f"g_{item['id']}"), f"g_{item['id']}"))
+    return tables
+
+
+def fingerprint(body):
+    return hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
+
+
+def load_cache(path: Path, body):
+    if not path.exists():
+        return None
+    try:
+        record = json.loads(path.read_text())
+        if record.get("request_sha256") != fingerprint(body) or record.get("endpoint") != ENDPOINT:
+            return None
+        table_values(record["response"])
+        return record
+    except (ValueError, KeyError, TypeError) as error:
+        raise JevError("Cannot read cached Jev answers; select Fresh Jev to replace them.") from error
+
+
+def save_cache(path: Path, body, response, duration):
+    table_values(response)
+    record = {"endpoint": ENDPOINT, "request_sha256": fingerprint(body),
+              "created_at": datetime.now(UTC).isoformat(), "elapsed_seconds": duration, "response": response}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(record) + "\n")
+    temporary.replace(path)
+    return record

@@ -1,4 +1,4 @@
-"""Build and run SERV with a fresh Jev answer for every gate evaluation."""
+"""Build and run SERV with cached Jev Boolean lookup tables."""
 
 import argparse
 import json
@@ -22,9 +22,10 @@ def main():
     classify = sub.add_parser("classify", help="Ask Jev to classify expression,input-bits pairs")
     classify.add_argument("expressions", nargs="+", help="e.g. AB,01 A+B,01 !A,0 A^B,11 S?B:A,011")
     classify.add_argument("--model", default=MODEL)
-    run = sub.add_parser("run", help="Run a compiled flat RV32I binary with live Jev gates")
+    run = sub.add_parser("run", help="Run a compiled flat RV32I binary with cached Jev gates")
     run.add_argument("firmware", nargs="?", type=Path, default=ROOT / "build/demo.bin")
     run.add_argument("--model", default=MODEL)
+    run.add_argument("--fresh", action="store_true", help="Replace the cached lookup tables with new Jev choices")
     run.add_argument("--max-cycles", type=int, default=200000)
     args = parser.parse_args()
     if args.command == "netlist":
@@ -56,11 +57,11 @@ def main():
         if event["type"] == "output":
             print(chr(event["byte"]), end="", flush=True)
         elif event["type"] == "response":
-            print(f"cycle={event['cycle']} phase={event['phase']} gates={event['gates']} Jev={event['duration']:.3f}s", file=sys.stderr)
+            print(f"Jev tables: {event['source']}; input cost=${event['input_cost_usd']:.9f}", file=sys.stderr)
         elif event["type"] == "halt":
             print(f"exit={event['exit_code']}", file=sys.stderr)
 
-    Simulation(args.firmware.resolve(), log, model=args.model, max_cycles=args.max_cycles).run()
+    Simulation(args.firmware.resolve(), log, model=args.model, max_cycles=args.max_cycles, fresh=args.fresh).run()
     return 0
 
 

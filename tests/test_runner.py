@@ -2,13 +2,19 @@ import json
 import re
 import subprocess
 import tempfile
-import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
-from engine import Simulation
-from jev import JevError, answer_bit, payload
+from jev import (
+    GATES,
+    JevError,
+    answer_bit,
+    load_cache,
+    payload,
+    save_cache,
+    table_cases,
+    table_values,
+)
 from netlist import translate
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -51,14 +57,17 @@ class ClassifierTests(unittest.TestCase):
             with self.assertRaises(JevError):
                 answer_bit(answer, "gate")
 
-    def test_repeated_batches_make_new_requests(self):
-        body = payload([{"id": 0, "gate": "AND", "bits": "01"}])
-        simulation = Simulation(ROOT / "build/demo.bin", lambda event: None)
-        simulation.started = time.monotonic()
-        with patch("engine.request", side_effect=fixture_request) as api:
-            simulation.classify(body)
-            simulation.classify(body)
-            self.assertEqual(api.call_count, 2)
+    def test_cache_preserves_unchecked_answers_and_matches_prompt(self):
+        body = payload(table_cases())
+        response = reference_response(body)
+        response["answers"]["g_0"].update(choice="false", confidence=0.001)
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / "jev.json"
+            save_cache(cache, body, response, 0.1)
+            record = load_cache(cache, body)
+            self.assertEqual(table_values(record["response"])["NOT"][0], 0)
+            self.assertIsNone(load_cache(cache, payload(table_cases(), model="another-model")))
+
 
 
 class ExecutionTests(unittest.TestCase):
@@ -83,44 +92,23 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("TIMEOUT", result.stderr)
 
-    def test_live_gate_choices_drive_dependent_inputs_without_reuse(self):
-        header = (ROOT / "build/serv_netlist.h").read_text().split(" GATES = {{", 1)[1].split("}};", 1)[0]
-        gates = [tuple(map(int, row.split(','))) for row in re.findall(r"\{([0-9,]+)\}", header)]
-        process = subprocess.Popen([str(ROOT / "build/serv_sim"), str(ROOT / "build/demo.bin"), "1"],
-                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        observed = {}
-        checked = 0
-        passes = set()
-        try:
-            for line in process.stdout:
-                event = json.loads(line)
-                if event["type"] != "gates":
-                    continue
-                phase = event["phase"]
-                passes.add(phase)
-                if event["batch"][0]["id"] == 0:
-                    observed = {}
-                output = "1" if phase == 0 else "0"
-                for gate in event["batch"]:
-                    _, arity, a, b, s, y, level = gates[gate["id"]]
-                    self.assertEqual(level, event["level"])
-                    for wire, bit in zip((a, b, s)[:arity], gate["bits"]):
-                        if wire in observed:
-                            self.assertEqual(bit, observed[wire])
-                            checked += 1
-                    observed[y] = output
-                process.stdin.write(output * len(event["batch"]) + "\n")
-                process.stdin.flush()
-            process.wait(timeout=2)
-        finally:
-            if process.poll() is None:
-                process.kill()
-                process.wait()
-            for pipe in (process.stdin, process.stdout, process.stderr):
-                pipe.close()
-        self.assertGreater(checked, 1000)
-        self.assertEqual(passes, {0, 1})  # Same gates are asked again before the first clock edge.
-        self.assertEqual(process.returncode, 2)  # One-cycle limit, not an answer rejection.
+    def test_cached_choices_really_drive_cpu_execution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            table_file = Path(directory) / "tables.txt"
+            tables = table_values(reference_response(payload(table_cases())))
+            table_file.write_text("\n".join(" ".join(map(str, tables[gate])) for gate in GATES))
+            result = subprocess.run([str(ROOT / "build/serv_sim"), str(ROOT / "build/demo.bin"), str(table_file), "200000"],
+                                    input="go\n" * 1000, text=True, capture_output=True, timeout=5, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            events = [json.loads(line) for line in result.stdout.splitlines()]
+            self.assertIn("fib(10)=55", "".join(chr(e["byte"]) for e in events if e["type"] == "output"))
+            self.assertEqual(len(events[-1]["gate_values"]), 4637)
+            # Wrong table choices are consumed as-is, not replaced with native logic.
+            table_file.write_text(" ".join("0" for _ in range(22)))
+            result = subprocess.run([str(ROOT / "build/serv_sim"), str(ROOT / "build/demo.bin"), str(table_file), "100"],
+                                    input="go\n" * 1000, text=True, capture_output=True, timeout=5, check=False)
+            self.assertEqual(result.returncode, 2)
+            self.assertNotIn("SERV PASS", result.stderr)
 
 
 class NetlistTests(unittest.TestCase):

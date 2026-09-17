@@ -26,22 +26,23 @@
         <span>Clock speed</span><div><strong id="hz">0</strong> <span id="hz-unit">Hz</span></div>
         <canvas id="speed-chart" width="420" height="32" aria-label="Clock speed over time" role="img"></canvas>
       </div>
-      <dl><div><dt>Cycles</dt><dd id="cycles">0</dd></div><div><dt>Fetched</dt><dd id="fetched">0</dd></div><div><dt>Jev requests</dt><dd id="requests">0</dd></div><div><dt>Gate evaluations</dt><dd id="lookups">0</dd></div><div><dt>Input tokens</dt><dd id="input-tokens">0</dd></div><div title="Estimated input cost only, at $0.042 per million input tokens. Output pricing is not included. Requests still in flight when stopped may be billed but have no reported usage yet."><dt>Est. input cost</dt><dd id="input-cost">$0</dd></div></dl>
+      <dl><div><dt>Cycles</dt><dd id="cycles">0</dd></div><div><dt>Fetched</dt><dd id="fetched">0</dd></div><div><dt>Jev requests</dt><dd id="requests">0</dd></div><div><dt>Gate lookups</dt><dd id="lookups">0</dd></div><div><dt>Input tokens</dt><dd id="input-tokens">0</dd></div><div title="Estimated input cost only, at $0.042 per million input tokens. Output pricing is not included. Requests still in flight when stopped may be billed but have no reported usage yet."><dt>Est. input cost</dt><dd id="input-cost">$0</dd></div></dl>
     </section>
     <section class="toolbar" aria-label="Program controls">
       <div class="programs" role="tablist" aria-label="Example programs">
         {% for program in programs %}<button role="tab" id="tab-{{ program.id }}" aria-controls="source" aria-selected="{{ 'true' if loop.first else 'false' }}" data-program="{{ program.id }}">{{ program.name }}</button>{% endfor %}
       </div>
       <div class="controls">
-        <button id="run" class="primary">Run</button><button id="step" title="Evaluate the next batch of independent gates">Step gates</button><button id="reset" aria-label="Reset execution">Reset</button>
+        <select id="gate-source" aria-label="Jev lookup tables"><option value="cached">Cached Jev</option><option value="fresh">Fresh Jev</option></select>
+        <button id="run" class="primary">Run</button><button id="step" title="Execute one instruction">Step</button><button id="reset" aria-label="Reset execution">Reset</button>
       </div>
     </section>
     <div id="error" role="alert" hidden></div>
     <section class="panel timing-panel" aria-label="SERV timing diagram">
       <div class="panel-title"><h2>Timing</h2><span id="wave-range">64 cycles</span></div>
-      <div class="gate-caption"><span id="gate-position">Waiting</span><span id="gate-count">0 / 4,637 gates</span></div>
-      <canvas id="gate-grid" width="1200" height="120" role="img" aria-label="Live gate outputs"></canvas>
-      <div class="gate-legend"><span>1 · white / 0 · gray</span><span>Fresh Jev output for every gate</span></div>
+      <div class="gate-caption"><span id="gate-position">Waiting</span><span id="gate-count">0 sampled gates</span></div>
+      <canvas id="gate-grid" width="1200" height="120" role="img" aria-label="Sampled gate outputs"></canvas>
+      <div class="gate-legend"><span>1 · white / 0 · gray</span><span>Cached Jev gate outputs</span></div>
       <canvas id="timing" width="1200" height="222" role="img" aria-label="Sampled SERV signals: clock, instruction fetch, data bus, serial processing, register read and register write"></canvas>
       <div class="bit-strip" id="bit-strip" aria-label="32-bit serial datapath"></div>
       <div class="timing-footer"><span id="wave-cursor">—</span><span>1 bit / cycle</span></div>

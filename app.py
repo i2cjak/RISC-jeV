@@ -48,10 +48,11 @@ def program_data():
 
 
 class Run:
-    def __init__(self, program, mode, source=None):
+    def __init__(self, program, mode, source=None, fresh=False):
         self.id = uuid.uuid4().hex
         self.program = program
         self.source = source
+        self.fresh = fresh
         self.binary = ROOT / f"build/{program}.bin"
         self.mode = mode
         self.credits = 1 if mode == "step" else 0
@@ -92,6 +93,7 @@ class Run:
             if "wave" in event:
                 if self.last_wave_event is not None:
                     self.last_wave_event.pop("wave", None)
+                    self.last_wave_event.pop("gate_values", None)
                 self.last_wave_event = event
             self.events.append(event)
             self.condition.notify_all()
@@ -160,7 +162,7 @@ class Run:
                 self.emit({"type": "compiled", "bytes": self.binary.stat().st_size})
             if self.cancelled:
                 return
-            self.simulation = Simulation(self.binary, self.simulation_event, self.wait_for_permission)
+            self.simulation = Simulation(self.binary, self.simulation_event, self.wait_for_permission, fresh=self.fresh)
             self.state = "running"
             self.emit({"type": "status", "state": "running"})
             self.simulation.run()
@@ -220,7 +222,7 @@ def start_run():
     data = request.get_json()
     if not isinstance(data, dict) or data.get("program") not in PROGRAMS:
         abort(400, "Unknown program")
-    if data.get("mode", "run") not in ("run", "step"):
+    if data.get("mode", "run") not in ("run", "step") or type(data.get("fresh", False)) is not bool:
         abort(400, "Invalid mode")
     source = data.get("source")
     if source is not None and (not isinstance(source, str) or not source.strip() or len(source.encode()) > 12000):
@@ -243,7 +245,7 @@ def start_run():
         for identifier in list(jobs):
             if len(jobs) >= 24 and jobs[identifier].done:
                 del jobs[identifier]
-        job = Run(data["program"], data.get("mode", "run"), source)
+        job = Run(data["program"], data.get("mode", "run"), source, data.get("fresh", False))
         jobs[job.id] = job
         if source is not None:
             if len(compile_limits) > 10000:
