@@ -18,6 +18,8 @@ def classified(*args, **kwargs):
 class WebTests(unittest.TestCase):
     def setUp(self):
         web.rate_limits.clear()
+        web.compile_limits.clear()
+        web.compile_times.clear()
         self.client = web.app.test_client()
         self.patcher = patch("app.truth_tables", side_effect=classified)
         self.patcher.start()
@@ -127,6 +129,31 @@ class WebTests(unittest.TestCase):
         self.wait(job, lambda: job.done)
         self.assertEqual(job.state, "error")
         self.assertFalse(any(e["type"] == "request" for e in job.events))
+
+    def test_infinite_loop_is_terminated(self):
+        job = self.start(source='int main(void) { for (;;) { __asm__ volatile ("nop"); } }', fresh=False)
+        self.wait(job, lambda: job.done)
+        self.assertEqual(job.state, "error")
+        self.assertIsNotNone(job.process.poll())
+        self.assertTrue(any("TIMEOUT" in e.get("message", "") for e in job.events))
+
+    def test_compilation_cooldown_is_server_enforced(self):
+        job = self.start(source='int main(void) { return 0; }', fresh=False)
+        self.wait(job, lambda: job.done)
+        response = self.client.post("/api/runs", json={"program": "sum", "source": "int main(void) {return 1;}"})
+        self.assertEqual(response.status_code, 429)
+        self.assertGreater(response.json["retry_after"], 0)
+        self.assertEqual(response.headers["Retry-After"], str(response.json["retry_after"]))
+        self.assertGreater(self.client.get("/api/limits").json["compile_retry_after"], 0)
+        example = self.start(fresh=False)
+        self.wait(example, lambda: example.done)
+        self.assertEqual(example.state, "complete")
+
+    def test_global_compilation_cap_applies_to_another_ip(self):
+        web.compile_times.extend([web.time.monotonic()] * 20)
+        response = self.client.post("/api/runs", json={"program": "sum", "source": "int main(void) {return 0;}"}, environ_overrides={"REMOTE_ADDR": "192.0.2.2"})
+        self.assertEqual(response.status_code, 429)
+        self.assertGreater(response.json["retry_after"], 0)
 
 
 if __name__ == "__main__":

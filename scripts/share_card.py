@@ -20,7 +20,13 @@ def face(size):
 image = Image.new("RGB", (1200, 630), "#080808")
 draw = ImageDraw.Draw(image)
 draw.text((60, 35), "Jev / SERV", font=face(24), fill="white")
-draw.text((55, 170), "RISC-jeV", font=face(124), fill="white")
+large = face(124)
+small = face(47)
+draw.text((55, 295), "RISC-", font=large, fill="white", anchor="ls")
+cursor = 55 + draw.textlength("RISC-", font=large)
+draw.text((cursor, 295), "je", font=small, fill="white", anchor="ls")
+cursor += draw.textlength("je", font=small) + 4
+draw.text((cursor, 295), "V", font=large, fill="white", anchor="ls")
 draw.text((63, 355), "Simulated RISC-V CPU", font=face(24), fill="#bcbcbc")
 for row, label in enumerate(("CLK", "FETCH", "SERIAL")):
     top = 465 + row * 43

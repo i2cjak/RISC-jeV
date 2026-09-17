@@ -9,6 +9,7 @@ let terminal = false, pendingRows = [], frame = 0, requestNode = null, requestBo
 let samples = [], lastSample = performance.now(), lastCycles = 0, hz = 0;
 let inputTokens = 0, inputCost = 0, wave = [], waveHover = -1;
 let edited = false;
+let compileReadyAt = 0;
 const expressions = { NOT: '!A', AND: 'AB', OR: 'A+B', XOR: 'A^B', MUX: 'S?B:A' };
 
 function element(tag, text, className) {
@@ -23,16 +24,18 @@ async function post(path, data) {
   const response = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
   if (!response.ok) {
     let reason = `Request failed (${response.status})`;
-    try { const body = await response.json(); if (body.error) reason = body.error; } catch { /* Non-JSON error */ }
+    try { const body = await response.json(); if (body.error) reason = body.error; if (body.retry_after) compileReadyAt = Date.now() + body.retry_after * 1000; } catch { /* Non-JSON error */ }
     throw new Error(reason);
   }
   return response.json();
 }
 function updateControls() {
   const running = ['running', 'classifying', 'compiling'].includes(state);
-  $('run').textContent = running ? 'Pause' : edited && (!runId || terminal) ? 'Compile & run' : 'Run';
-  $('run').disabled = starting;
-  $('step').disabled = starting || running;
+  const needsCompile = edited && (!runId || terminal);
+  const cooldown = needsCompile ? Math.max(0, Math.ceil((compileReadyAt - Date.now()) / 1000)) : 0;
+  $('run').textContent = running ? 'Pause' : cooldown ? `Compile (${cooldown}s)` : needsCompile ? 'Compile & run' : 'Run';
+  $('run').disabled = starting || cooldown > 0;
+  $('step').disabled = starting || running || cooldown > 0;
   $('gate-source').disabled = !!runId && !terminal;
   $('source').readOnly = !!runId && !terminal;
   $('restore').disabled = !!runId && !terminal;
@@ -179,6 +182,7 @@ async function start(mode) {
     const options = { program, fresh: $('gate-source').value === 'fresh', mode };
     if (edited) options.source = $('source').value;
     const result = await post('/api/runs', options);
+    if (result.compile_cooldown_seconds) compileReadyAt = Date.now() + result.compile_cooldown_seconds * 1000;
     if (token !== generation) { await post(`/api/runs/${result.id}/control`, { action: 'stop' }); return; }
     runId = result.id;
     stream = new EventSource(`/api/runs/${runId}/events`);
@@ -220,6 +224,7 @@ setInterval(() => {
     scheduleRender();
   } else if (state === 'paused') { hz = 0; scheduleRender(); }
   lastCycles = cycles; lastSample = now;
+  if (compileReadyAt) updateControls();
 }, 250);
 for (let bit = 0; bit < 32; ++bit) {
   const node = element('span', String(bit)); node.title = `Bit ${bit}`; $('bit-strip').append(node);
@@ -319,4 +324,8 @@ if (location.hash.startsWith('#code=')) {
     for (const tab of document.querySelectorAll('[data-program]')) tab.setAttribute('aria-selected', String(tab.dataset.program === program));
   } catch (e) { error(e.message); }
 }
+fetch('/api/limits').then(response => response.json()).then(data => {
+  if (data.compile_retry_after) compileReadyAt = Math.max(compileReadyAt, Date.now() + data.compile_retry_after * 1000);
+  updateControls();
+}).catch(() => {});
 render();

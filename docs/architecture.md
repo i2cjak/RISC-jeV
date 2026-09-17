@@ -9,8 +9,13 @@ and run it. No shared program runs automatically when its link is opened.
 Visitor compilation uses a separate filesystem, no network, an empty environment,
 and CPU/memory/output/time limits. Railway uses a chroot with a dedicated
 unprivileged UID and seccomp; local Linux uses Bubblewrap plus seccomp. A compiler
-error is returned before making a Jev request. Runs are limited to 250,000 cycles,
-six concurrent runs, and 12 starts per IP per minute.
+error is returned before making a Jev request. Runs stop after five seconds of
+execution or 250,000 cycles, whichever comes first. Paused stepping time is
+excluded. The server allows six concurrent runs and 12 starts per IP per minute.
+Custom compilation has a 30-second per-IP cooldown, a shared limit of 20 per
+minute across the server, and one active compiler. Precompiled examples do not
+consume the compilation quota. The browser shows the cooldown; the server
+enforces it even if the browser is bypassed or reloaded.
 
 Compiles C to RV32I and runs it on a gate-level simulation of the SERV CPU in
 `serv/`. Jev classifies Boolean gate outputs through TypeSafe's

@@ -1,5 +1,6 @@
 #include "serv_netlist.h"
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
@@ -108,6 +109,8 @@ int main(int argc, char **argv) try {
     ram.resize(65536, 0);
     CPU cpu(argv[2]);
     Waveform waveform;
+    const auto execution_started = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::duration control_wait{};
     uint64_t fetches = 0, loads = 0, stores = 0;
     auto word = [&](uint32_t address) {
         address &= ~3u;
@@ -117,6 +120,10 @@ int main(int argc, char **argv) try {
     };
 
     for (uint64_t cycle = 0; cycle < limit; ++cycle) {
+        if ((cycle & 255u) == 0 && std::chrono::steady_clock::now() - execution_started - control_wait >= std::chrono::seconds(5)) {
+            std::cerr << "SERV TIMEOUT: 5-second execution limit reached; cycles=" << cycle << '\n';
+            return 2;
+        }
         const bool reset = cycle < 8;
         cpu.write(i_rst, reset);
         cpu.write(i_ibus_ack, 0);
@@ -137,7 +144,9 @@ int main(int argc, char **argv) try {
                 waveform.json();
                 std::cout << "}" << std::endl;
                 std::string command;
+                const auto waiting_started = std::chrono::steady_clock::now();
                 if (!std::getline(std::cin, command) || command != "go") return 0;
+                control_wait += std::chrono::steady_clock::now() - waiting_started;
             }
             cpu.write(i_ibus_rdt, instruction);
             cpu.write(i_ibus_ack, 1);

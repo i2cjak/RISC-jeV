@@ -1,6 +1,7 @@
 """Web UI for the real SERV gate simulator. Run with one threaded worker."""
 
 import json
+import math
 import os
 import re
 import subprocess
@@ -27,6 +28,19 @@ jobs_lock = threading.Lock()
 classifier_lock = threading.Lock()
 compiler_lock = threading.Lock()
 rate_limits = {}
+compile_limits = {}
+compile_times = deque()
+COMPILE_COOLDOWN = 30
+COMPILES_PER_MINUTE = 20
+
+
+def compilation_delay(visitor, now):
+    while compile_times and now - compile_times[0] >= 60:
+        compile_times.popleft()
+    remaining = max(0, COMPILE_COOLDOWN - (now - compile_limits.get(visitor, -COMPILE_COOLDOWN)))
+    if len(compile_times) >= COMPILES_PER_MINUTE:
+        remaining = max(remaining, 60 - (now - compile_times[0]))
+    return math.ceil(remaining)
 
 
 def program_data():
@@ -250,6 +264,10 @@ def start_run():
     with jobs_lock:
         now = time.monotonic()
         visitor = request.remote_addr or "unknown"
+        if source is not None:
+            delay = compilation_delay(visitor, now)
+            if delay:
+                return {"error": f"Compilation cooldown: try again in {delay}s.", "retry_after": delay}, 429, {"Retry-After": str(delay)}
         recent = [stamp for stamp in rate_limits.get(visitor, []) if now - stamp < 60]
         if len(recent) >= 12:
             abort(429, "Limit: 12 runs per minute. Try again shortly.")
@@ -263,8 +281,19 @@ def start_run():
                 del jobs[identifier]
         job = Run(data["program"], data.get("fresh", True), data.get("mode", "run"), source)
         jobs[job.id] = job
+        if source is not None:
+            if len(compile_limits) > 10000:
+                compile_limits.clear()
+            compile_limits[visitor] = now
+            compile_times.append(now)
     threading.Thread(target=job.work, daemon=True).start()
-    return {"id": job.id}, 201
+    return {"id": job.id, "compile_cooldown_seconds": COMPILE_COOLDOWN if source is not None else 0}, 201
+
+
+@app.get("/api/limits")
+def limits():
+    with jobs_lock:
+        return {"compile_retry_after": compilation_delay(request.remote_addr or "unknown", time.monotonic())}
 
 
 @app.errorhandler(400)
