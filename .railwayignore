@@ -1,0 +1,7 @@
+.env
+.env.*
+.venv/
+build/
+**/.git/
+**/__pycache__/
+.ruff_cache/

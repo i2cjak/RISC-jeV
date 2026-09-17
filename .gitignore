@@ -1,0 +1,9 @@
+.venv/
+.env
+.env.*
+build/
+__pycache__/
+*.pyc
+.ruff_cache/
+.railway/
+static/fonts/*.woff2

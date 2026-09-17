@@ -1,0 +1,9 @@
+[project]
+name = "jev-serv"
+version = "0.1.0"
+description = "Run compiled RV32I code on SERV using Jev-classified Boolean gates"
+requires-python = ">=3.11"
+dependencies = ["yowasp-yosys>=0.63", "flask>=3.1", "gunicorn>=23"]
+
+[tool.uv]
+package = false

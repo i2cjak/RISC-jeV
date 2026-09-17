@@ -1,0 +1,3 @@
+[submodule "serv"]
+	path = serv
+	url = https://github.com/olofk/serv.git
